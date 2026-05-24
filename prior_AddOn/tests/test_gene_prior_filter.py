@@ -141,7 +141,7 @@ def test_nichetrans_rejects_unfiltered_prior():
         NicheTrans(source_length=3, target_length=1, priors=priors)
 
 
-def test_nichetrans_sigmoid_prior_pooling_forward_returns_weights():
+def test_nichetrans_qkv_prior_pooling_forward_returns_attention_and_gate():
     pytest.importorskip("einops")
     from model.nicheTrans import NicheTrans
 
@@ -149,33 +149,7 @@ def test_nichetrans_sigmoid_prior_pooling_forward_returns_weights():
         source_length=3,
         target_length=2,
         priors=_toy_priors(),
-        prior_pooling_mode="sigmoid",
-    )
-    model.eval()
-    source = torch.rand(2, 3)
-    source_neighbor = torch.rand(2, 2, 3)
-
-    with torch.no_grad():
-        output, prior_info = model(source, source_neighbor, return_prior=True)
-
-    assert output.shape == (2, 2)
-    assert prior_info["prior_weights"].shape == (2, 3)
-    assert torch.all(prior_info["prior_weights"] >= 0)
-    assert torch.all(prior_info["prior_weights"] <= 1)
-    assert prior_info["h_cell0"].shape == (2, 256)
-    assert prior_info["h_niche"].shape == (2, 256)
-    assert prior_info["z_prior"].shape == (2, 256)
-
-
-def test_nichetrans_softmax_prior_pooling_weights_sum_to_one():
-    pytest.importorskip("einops")
-    from model.nicheTrans import NicheTrans
-
-    model = NicheTrans(
-        source_length=3,
-        target_length=2,
-        priors=_toy_priors(),
-        prior_pooling_mode="softmax",
+        prior_pooling_mode="qkv",
     )
     model.eval()
     source = torch.rand(2, 3)
@@ -191,6 +165,36 @@ def test_nichetrans_softmax_prior_pooling_weights_sum_to_one():
         torch.ones(2),
         atol=1e-6,
     )
+    assert prior_info["h_cell0"].shape == (2, 256)
+    assert prior_info["h_niche"].shape == (2, 256)
+    assert prior_info["z_prior"].shape == (2, 256)
+    assert prior_info["prior_gate"].shape == (2, 256)
+    assert torch.all(prior_info["prior_gate"] >= 0)
+    assert torch.all(prior_info["prior_gate"] <= 1)
+
+
+def test_qkv_prior_pooling_expression_modulates_value_not_attention():
+    from model.gene_prior_pooling import GenePriorPooling
+
+    pooling = GenePriorPooling(
+        gene_embedding_dim=5,
+        output_dim=256,
+        hidden_dim=16,
+        mode="qkv",
+    )
+    pooling.eval()
+    gene_embeddings = torch.randn(3, 5)
+    h_niche = torch.randn(2, 256)
+    expression_a = torch.ones(2, 3)
+    expression_b = expression_a.clone()
+    expression_b[:, 1] = 4.0
+
+    with torch.no_grad():
+        z_prior_a, weights_a = pooling(expression_a, gene_embeddings, h_niche)
+        z_prior_b, weights_b = pooling(expression_b, gene_embeddings, h_niche)
+
+    assert torch.allclose(weights_a, weights_b)
+    assert not torch.allclose(z_prior_a, z_prior_b)
 
 
 def test_nichetrans_prior_pooling_requires_priors():
@@ -198,7 +202,7 @@ def test_nichetrans_prior_pooling_requires_priors():
     from model.nicheTrans import NicheTrans
 
     with pytest.raises(ValueError, match="requires priors"):
-        NicheTrans(source_length=3, target_length=1, prior_pooling_mode="sigmoid")
+        NicheTrans(source_length=3, target_length=1, prior_pooling_mode="qkv")
 
 
 def test_nichetrans_prior_pooling_none_keeps_default_forward_interface():

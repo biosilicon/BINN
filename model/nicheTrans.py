@@ -5,7 +5,7 @@ import torchvision
 from torch import nn
 
 from model.attention import *
-from model.gene_prior_pooling import GenePriorPooling
+from model.gene_prior_pooling import GenePriorPooling, GatedPriorFusion
 
 
 class NetBlock(nn.Module):
@@ -116,8 +116,8 @@ class NicheTrans(nn.Module):
 
     def _normalize_prior_pooling_mode(self, prior_pooling_mode):
         mode = str(prior_pooling_mode).lower()
-        if mode not in {"none", "sigmoid", "softmax"}:
-            raise ValueError("prior_pooling_mode must be 'none', 'sigmoid', or 'softmax'.")
+        if mode not in {"none", "qkv"}:
+            raise ValueError("prior_pooling_mode must be 'none' or 'qkv'.")
         return mode
 
     def _resolve_prior_model(self, priors, prior_model):
@@ -192,11 +192,7 @@ class NicheTrans(nn.Module):
             mode=self.prior_pooling_mode,
             expr_transform=self.prior_expr_transform,
         )
-        self.prior_fusion = nn.Sequential(
-            nn.Linear(self.fea_size * 3, self.fea_size),
-            nn.LayerNorm(self.fea_size),
-            nn.LeakyReLU(),
-        )
+        self.prior_fusion = GatedPriorFusion(self.fea_size)
 
     def forward(self, source, source_neighbor, return_prior=False):
         b = source.size(0)
@@ -230,9 +226,10 @@ class NicheTrans(nn.Module):
                 self.teacher_embedding,
                 h_niche,
             )
-            f = self.prior_fusion(torch.cat([h_cell0, h_niche, z_prior], dim=1))
+            f, prior_gate = self.prior_fusion(h_cell0, h_niche, z_prior)
             prior_info["z_prior"] = z_prior
             prior_info["prior_weights"] = prior_weights
+            prior_info["prior_gate"] = prior_gate
         else:
             f = h_niche
 

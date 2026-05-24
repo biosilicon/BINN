@@ -1,5 +1,7 @@
 from __future__ import absolute_import
 
+import math
+
 import torch
 from torch import nn
 
@@ -10,14 +12,14 @@ class GenePriorPooling(nn.Module):
         gene_embedding_dim,
         output_dim,
         hidden_dim=128,
-        mode="sigmoid",
+        mode="qkv",
         expr_transform="identity",
     ):
         super(GenePriorPooling, self).__init__()
 
         mode = str(mode).lower()
-        if mode not in {"sigmoid", "softmax"}:
-            raise ValueError("mode must be 'sigmoid' or 'softmax'.")
+        if mode != "qkv":
+            raise ValueError("mode must be 'qkv'.")
 
         expr_transform = str(expr_transform).lower()
         if expr_transform not in {"identity", "log1p"}:
@@ -25,11 +27,10 @@ class GenePriorPooling(nn.Module):
 
         self.mode = mode
         self.expr_transform = expr_transform
-        self.gene_projection = nn.Linear(gene_embedding_dim, output_dim, bias=False)
-        self.gene_score = nn.Linear(gene_embedding_dim, hidden_dim, bias=False)
-        self.expression_score = nn.Linear(1, hidden_dim, bias=False)
-        self.context_score = nn.Linear(output_dim, hidden_dim, bias=True)
-        self.score_out = nn.Linear(hidden_dim, 1, bias=True)
+        self.scale = 1.0 / math.sqrt(hidden_dim)
+        self.query_projection = nn.Linear(output_dim, hidden_dim, bias=False)
+        self.key_projection = nn.Linear(gene_embedding_dim, hidden_dim, bias=False)
+        self.value_projection = nn.Linear(gene_embedding_dim, output_dim, bias=False)
 
     def forward(self, expression, gene_embeddings, h_niche):
         if expression.ndim != 2:
@@ -55,23 +56,48 @@ class GenePriorPooling(nn.Module):
         h_niche = h_niche.to(dtype=gene_embeddings.dtype)
         transformed_expression = self._transform_expression(expression)
 
-        gene_hidden = self.gene_score(gene_embeddings).unsqueeze(0)
-        expression_hidden = self.expression_score(transformed_expression.unsqueeze(-1))
-        context_hidden = self.context_score(h_niche).unsqueeze(1)
-        scores = self.score_out(torch.tanh(gene_hidden + expression_hidden + context_hidden)).squeeze(-1)
-
-        if self.mode == "softmax":
-            weights = torch.softmax(scores, dim=1)
-            weighted_expression = weights
-        else:
-            weights = torch.sigmoid(scores)
-            weighted_expression = weights * transformed_expression
-
-        projected_genes = self.gene_projection(gene_embeddings)
-        z_prior = torch.matmul(weighted_expression, projected_genes)
+        query = self.query_projection(h_niche)
+        key = self.key_projection(gene_embeddings)
+        value = self.value_projection(gene_embeddings)
+        scores = torch.matmul(query, key.transpose(0, 1)) * self.scale
+        weights = torch.softmax(scores, dim=1)
+        z_prior = torch.matmul(weights * transformed_expression, value)
         return z_prior, weights
 
     def _transform_expression(self, expression):
         if self.expr_transform == "log1p":
             return torch.log1p(expression.clamp_min(0))
         return expression
+
+
+class GatedPriorFusion(nn.Module):
+    def __init__(self, dim):
+        super(GatedPriorFusion, self).__init__()
+
+        self.cell_norm = nn.LayerNorm(dim)
+        self.niche_norm = nn.LayerNorm(dim)
+        self.prior_norm = nn.LayerNorm(dim)
+        self.delta = nn.Sequential(
+            nn.Linear(dim * 3, dim),
+            nn.LayerNorm(dim),
+            nn.LeakyReLU(),
+            nn.Linear(dim, dim),
+        )
+        self.gate = nn.Linear(dim * 3, dim)
+        self.output_norm = nn.LayerNorm(dim)
+
+        nn.init.constant_(self.gate.bias, -2.0)
+
+    def forward(self, h_cell0, h_niche, z_prior):
+        fusion_input = torch.cat(
+            [
+                self.cell_norm(h_cell0),
+                self.niche_norm(h_niche),
+                self.prior_norm(z_prior),
+            ],
+            dim=1,
+        )
+        delta = self.delta(fusion_input)
+        gate = torch.sigmoid(self.gate(fusion_input))
+        fused = self.output_norm(h_niche + gate * delta)
+        return fused, gate
