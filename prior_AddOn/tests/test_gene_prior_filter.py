@@ -99,6 +99,10 @@ def test_nichetrans_registers_teacher_embedding_from_selected_prior():
     assert hasattr(model, "teacher_embedding")
     assert model.teacher_embedding.shape == (3, 5)
     assert not model.teacher_embedding.requires_grad
+    assert model.use_gene_prior is True
+    assert isinstance(model.gene_prior_projection, torch.nn.Linear)
+    assert model.gene_prior_projection.in_features == 5
+    assert model.gene_prior_projection.out_features == model.fea_size
     assert "teacher_embedding" in model.state_dict()
 
 
@@ -110,7 +114,93 @@ def test_nichetrans_has_empty_teacher_embedding_without_priors():
 
     assert hasattr(model, "teacher_embedding")
     assert model.teacher_embedding is None
+    assert model.use_gene_prior is False
+    assert model.gene_prior_projection is None
     assert "teacher_embedding" not in model.state_dict()
+    assert not any(key.startswith("gene_prior_projection") for key in model.state_dict())
+
+
+def test_nichetrans_forward_runs_with_gene_prior_projection():
+    pytest.importorskip("einops")
+    from model.nicheTrans import NicheTrans
+
+    priors = {
+        "geneformer": {
+            "embeddings": torch.randn(3, 5),
+            "found_mask": torch.tensor([True, True, True]),
+        }
+    }
+    model = NicheTrans(
+        source_length=3,
+        target_length=2,
+        noise_rate=0.0,
+        dropout_rate=0.0,
+        priors=priors,
+    )
+    model.eval()
+
+    source = torch.tensor([[1.0, 0.0, 2.0], [0.5, 1.0, 0.0]])
+    source_neighbor = torch.tensor(
+        [
+            [[0.0, 1.0, 0.0], [2.0, 0.0, 1.0]],
+            [[1.0, 1.0, 1.0], [0.0, 0.0, 0.0]],
+        ]
+    )
+
+    with torch.no_grad():
+        output = model(source, source_neighbor)
+
+    assert output.shape == (2, 2)
+
+
+def test_nichetrans_gene_prior_features_use_normalized_expression_weights():
+    pytest.importorskip("einops")
+    from model.nicheTrans import NicheTrans
+
+    priors = {
+        "geneformer": {
+            "embeddings": torch.tensor(
+                [
+                    [1.0, 0.0],
+                    [0.0, 2.0],
+                    [3.0, 3.0],
+                ]
+            ),
+            "found_mask": torch.tensor([True, True, True]),
+        }
+    }
+    model = NicheTrans(
+        source_length=3,
+        target_length=1,
+        noise_rate=0.0,
+        dropout_rate=0.0,
+        priors=priors,
+    )
+    with torch.no_grad():
+        model.gene_prior_projection.weight.zero_()
+        model.gene_prior_projection.bias.zero_()
+        model.gene_prior_projection.weight[0, 0] = 1.0
+        model.gene_prior_projection.weight[1, 1] = 1.0
+
+    omic_data = torch.tensor(
+        [
+            [2.0, 2.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [-1.0, 0.0, 3.0],
+        ]
+    )
+
+    projected = model._compute_gene_prior_features(omic_data)
+
+    expected = torch.tensor(
+        [
+            [0.5, 1.0],
+            [0.0, 0.0],
+            [3.0, 3.0],
+        ]
+    )
+    assert torch.allclose(projected[:, :2], expected)
+    assert torch.allclose(projected[:, 2:], torch.zeros_like(projected[:, 2:]))
 
 
 def test_nichetrans_requires_prior_model_when_multiple_priors_are_provided():

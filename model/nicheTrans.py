@@ -99,9 +99,16 @@ class NicheTrans(nn.Module):
         trunc_normal_(self.token_neigh_1, std=.02)
         trunc_normal_(self.token_neigh_2, std=.02)
 
+        ################# 
+        # teacher embedding from pretrained models
         self.register_buffer("teacher_embedding", None, persistent=False)
         self.teacher_embedding = None
         self._register_teacher_embedding(priors)
+        self.use_gene_prior = self.teacher_embedding is not None
+        if self.use_gene_prior:
+            self.gene_prior_projection = nn.Linear(self.teacher_embedding.size(1), self.fea_size)
+        else:
+            self.gene_prior_projection = None
 
     def _resolve_prior_model(self, priors, prior_model):
         if priors is None:
@@ -159,6 +166,15 @@ class NicheTrans(nn.Module):
         self.register_buffer("teacher_embedding", None, persistent=True)
         self.teacher_embedding = teacher_embedding
 
+    def _compute_gene_prior_features(self, omic_data):
+        if not self.use_gene_prior:
+            raise RuntimeError("Gene prior features were requested, but no teacher embedding is registered.")
+
+        expression = omic_data.clamp(min=0)
+        expression_sum = expression.sum(dim=1, keepdim=True)
+        weights = expression / expression_sum.clamp_min(1e-12)
+        prior_features = weights @ self.teacher_embedding
+        return self.gene_prior_projection(prior_features)
 
     def forward(self, source, source_neighbor):
         b = source.size(0)
@@ -169,7 +185,11 @@ class NicheTrans(nn.Module):
         omic_data = torch.cat([source, source_neighbor], dim=1).view(-1, self.source_length)
 
         # genome feature extraction, be aware that we add on the features
-        f_omic = self.encoder(omic_data).view(b, -1, self.fea_size) 
+        f_omic = self.encoder(omic_data)
+        if self.use_gene_prior:
+            gene_prior_features = self._compute_gene_prior_features(omic_data)
+            f_omic = f_omic + gene_prior_features
+        f_omic = f_omic.view(b, -1, self.fea_size) 
         f_omic = f_omic + spatial_tokens
 
         f_omic = self.non_linear(f_omic)
