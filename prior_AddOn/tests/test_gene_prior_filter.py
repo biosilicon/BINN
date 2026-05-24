@@ -96,6 +96,7 @@ def test_nichetrans_registers_teacher_embedding_from_selected_prior():
     model = NicheTrans(source_length=3, target_length=1, priors=priors)
 
     assert model.prior_model == "geneformer"
+    assert model.gene_prior_mode == "niche_conditioned"
     assert hasattr(model, "teacher_embedding")
     assert model.teacher_embedding.shape == (3, 5)
     assert not model.teacher_embedding.requires_grad
@@ -103,6 +104,8 @@ def test_nichetrans_registers_teacher_embedding_from_selected_prior():
     assert isinstance(model.gene_prior_projection, torch.nn.Linear)
     assert model.gene_prior_projection.in_features == 5
     assert model.gene_prior_projection.out_features == model.fea_size
+    assert isinstance(model.gene_prior_pooling, torch.nn.Module)
+    assert torch.sigmoid(model.gene_prior_gate).max().item() < 0.02
     assert "teacher_embedding" in model.state_dict()
 
 
@@ -116,8 +119,36 @@ def test_nichetrans_has_empty_teacher_embedding_without_priors():
     assert model.teacher_embedding is None
     assert model.use_gene_prior is False
     assert model.gene_prior_projection is None
+    assert model.gene_prior_gate is None
+    assert model.gene_prior_pooling is None
     assert "teacher_embedding" not in model.state_dict()
     assert not any(key.startswith("gene_prior_projection") for key in model.state_dict())
+    assert "gene_prior_gate" not in model.state_dict()
+    assert not any(key.startswith("gene_prior_pooling") for key in model.state_dict())
+
+
+def test_nichetrans_forward_runs_without_priors_and_state_dict_stays_baseline():
+    pytest.importorskip("einops")
+    from model.nicheTrans import NicheTrans
+
+    model = NicheTrans(source_length=3, target_length=2, noise_rate=0.0, dropout_rate=0.0)
+    model.eval()
+
+    source = torch.tensor([[1.0, 0.0, 2.0], [0.5, 1.0, 0.0]])
+    source_neighbor = torch.tensor(
+        [
+            [[0.0, 1.0, 0.0], [2.0, 0.0, 1.0]],
+            [[1.0, 1.0, 1.0], [0.0, 0.0, 0.0]],
+        ]
+    )
+
+    with torch.no_grad():
+        output = model(source, source_neighbor)
+
+    assert output.shape == (2, 2)
+    state_keys = model.state_dict().keys()
+    assert "teacher_embedding" not in state_keys
+    assert not any(key.startswith("gene_prior_") for key in state_keys)
 
 
 def test_nichetrans_forward_runs_with_gene_prior_projection():
@@ -175,6 +206,7 @@ def test_nichetrans_gene_prior_features_use_normalized_expression_weights():
         noise_rate=0.0,
         dropout_rate=0.0,
         priors=priors,
+        gene_prior_mode="expression_weighted",
     )
     with torch.no_grad():
         model.gene_prior_projection.weight.zero_()
@@ -201,6 +233,134 @@ def test_nichetrans_gene_prior_features_use_normalized_expression_weights():
     )
     assert torch.allclose(projected[:, :2], expected)
     assert torch.allclose(projected[:, 2:], torch.zeros_like(projected[:, 2:]))
+
+
+def test_nichetrans_none_mode_registers_embedding_but_skips_prior_branch():
+    pytest.importorskip("einops")
+    from model.nicheTrans import NicheTrans
+
+    priors = {
+        "geneformer": {
+            "embeddings": torch.randn(3, 5),
+            "found_mask": torch.tensor([True, True, True]),
+        }
+    }
+    model = NicheTrans(
+        source_length=3,
+        target_length=2,
+        noise_rate=0.0,
+        dropout_rate=0.0,
+        priors=priors,
+        gene_prior_mode="none",
+    )
+    model.eval()
+
+    assert model.teacher_embedding.shape == (3, 5)
+    assert model.use_gene_prior is False
+    assert model.gene_prior_projection is None
+    assert model.gene_prior_gate is None
+    assert model.gene_prior_pooling is None
+    assert not any(key.startswith("gene_prior_projection") for key in model.state_dict())
+    assert "gene_prior_gate" not in model.state_dict()
+    assert not any(key.startswith("gene_prior_pooling") for key in model.state_dict())
+
+    source = torch.tensor([[1.0, 0.0, 2.0], [0.5, 1.0, 0.0]])
+    source_neighbor = torch.tensor(
+        [
+            [[0.0, 1.0, 0.0], [2.0, 0.0, 1.0]],
+            [[1.0, 1.0, 1.0], [0.0, 0.0, 0.0]],
+        ]
+    )
+    with torch.no_grad():
+        output = model(source, source_neighbor)
+
+    assert output.shape == (2, 2)
+
+
+@pytest.mark.parametrize("gene_prior_mode", ["learnable_no_niche", "niche_conditioned"])
+def test_nichetrans_learnable_prior_modes_are_finite_with_zero_and_negative_expression(gene_prior_mode):
+    pytest.importorskip("einops")
+    from model.nicheTrans import NicheTrans
+
+    priors = {
+        "geneformer": {
+            "embeddings": torch.randn(3, 5),
+            "found_mask": torch.tensor([True, True, True]),
+        }
+    }
+    model = NicheTrans(
+        source_length=3,
+        target_length=2,
+        noise_rate=0.0,
+        dropout_rate=0.0,
+        priors=priors,
+        gene_prior_mode=gene_prior_mode,
+    )
+    model.eval()
+
+    source = torch.tensor([[0.0, 0.0, 0.0], [-1.0, 0.0, 3.0]])
+    source_neighbor = torch.tensor(
+        [
+            [[0.0, -1.0, 0.0], [0.0, 0.0, 0.0]],
+            [[1.0, 1.0, 1.0], [-2.0, 0.0, 0.0]],
+        ]
+    )
+
+    with torch.no_grad():
+        output = model(source, source_neighbor)
+
+    assert output.shape == (2, 2)
+    assert torch.isfinite(output).all()
+
+
+def test_nichetrans_embedding_controls_random_and_shuffled():
+    pytest.importorskip("einops")
+    from model.nicheTrans import NicheTrans
+
+    embeddings = torch.tensor(
+        [
+            [1.0, 2.0],
+            [3.0, 4.0],
+            [5.0, 6.0],
+            [7.0, 8.0],
+        ]
+    )
+    priors = {
+        "geneformer": {
+            "embeddings": embeddings,
+            "found_mask": torch.tensor([True, True, True, True]),
+        }
+    }
+
+    torch.manual_seed(1)
+    shuffled = NicheTrans(
+        source_length=4,
+        target_length=1,
+        priors=priors,
+        gene_prior_mode="expression_weighted",
+        gene_prior_embedding_control="shuffled",
+    )
+    shuffled_rows = sorted(tuple(row.tolist()) for row in shuffled.teacher_embedding)
+    original_rows = sorted(tuple(row.tolist()) for row in embeddings)
+    assert shuffled_rows == original_rows
+    assert not torch.equal(shuffled.teacher_embedding, embeddings)
+
+    torch.manual_seed(1)
+    random_control = NicheTrans(
+        source_length=4,
+        target_length=1,
+        priors=priors,
+        gene_prior_mode="expression_weighted",
+        gene_prior_embedding_control="random",
+    )
+    assert random_control.teacher_embedding.shape == embeddings.shape
+    assert not torch.equal(random_control.teacher_embedding, embeddings)
+    assert torch.allclose(random_control.teacher_embedding.mean(), embeddings.mean(), atol=1e-6)
+    assert torch.allclose(
+        random_control.teacher_embedding.std(unbiased=False),
+        embeddings.std(unbiased=False),
+        atol=1e-6,
+    )
 
 
 def test_nichetrans_requires_prior_model_when_multiple_priors_are_provided():
