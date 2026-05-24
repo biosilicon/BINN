@@ -94,6 +94,7 @@ class Breast_cancer(object):
         self.testing = self._process_data(testing_adata)
 
         self.rna_length, self.protein_length = 313, 2
+        self.source_panel=adata.var_names
         self.target_panel = np.array(['CD20', 'HER2'])
        
         num_training_spots = len(self.training)
