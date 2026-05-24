@@ -150,6 +150,7 @@ activemq-data/
 # Environments
 .env
 .envrc
+.conda/
 .venv
 env/
 venv/
@@ -205,6 +206,15 @@ tempCodeRunnerFile.py
 
 # Ruff stuff:
 .ruff_cache/
+
+# Static gene prior artifacts
+prior_AddOn/gene_embeddings/_probe/
+prior_AddOn/gene_embeddings/raw/
+prior_AddOn/gene_embeddings/**/*.pt
+prior_AddOn/gene_embeddings/**/*.pth
+prior_AddOn/gene_embeddings/**/*.bin
+prior_AddOn/gene_embeddings/**/*.safetensors
+prior_AddOn/gene_embeddings/**/*.pkl
 
 # PyPI configuration file
 .pypirc
