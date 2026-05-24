@@ -41,11 +41,20 @@ class NetBlock(nn.Module):
 
 # NicheTrans with spatial information only
 class NicheTrans(nn.Module):
-    def __init__(self, source_length=877, target_length=137, noise_rate=0.2, dropout_rate=0.1):
+    def __init__(
+        self,
+        source_length=877,
+        target_length=137,
+        noise_rate=0.2,
+        dropout_rate=0.1,
+        priors=None,
+        prior_model=None,
+    ):
         super(NicheTrans, self).__init__()
 
         self.source_length, self.target_length = source_length, target_length
         self.noise_rate, self.dropout_rate = noise_rate, dropout_rate
+        self.prior_model = self._resolve_prior_model(priors, prior_model)
 
         self.fea_size, self.img_size = 256, 128
 
@@ -89,6 +98,66 @@ class NicheTrans(nn.Module):
         trunc_normal_(self.token_center, std=.02)
         trunc_normal_(self.token_neigh_1, std=.02)
         trunc_normal_(self.token_neigh_2, std=.02)
+
+        self.register_buffer("teacher_embedding", None, persistent=False)
+        self.teacher_embedding = None
+        self._register_teacher_embedding(priors)
+
+    def _resolve_prior_model(self, priors, prior_model):
+        if priors is None:
+            return prior_model
+        if not priors:
+            raise ValueError("'priors' must contain at least one prior model.")
+        if prior_model is not None:
+            if prior_model not in priors:
+                raise ValueError(
+                    f"prior_model {prior_model!r} was not found in priors. "
+                    f"Available models: {sorted(priors)}"
+                )
+            return prior_model
+        if len(priors) == 1:
+            return next(iter(priors))
+        raise ValueError(
+            "Multiple prior models were provided. Pass prior_model explicitly. "
+            f"Available models: {sorted(priors)}"
+        )
+
+    def _register_teacher_embedding(self, priors):
+        if priors is None:
+            self.teacher_embedding = None
+            return
+
+        prior = priors[self.prior_model]
+        if "embeddings" not in prior:
+            raise ValueError(f"priors[{self.prior_model!r}] does not contain 'embeddings'.")
+
+        teacher_embedding = torch.as_tensor(prior["embeddings"], dtype=torch.float32).detach().clone()
+        if teacher_embedding.ndim != 2:
+            raise ValueError(
+                f"priors[{self.prior_model!r}]['embeddings'] must be two-dimensional, "
+                f"got shape {tuple(teacher_embedding.shape)}."
+            )
+        if teacher_embedding.size(0) != self.source_length:
+            raise ValueError(
+                f"Teacher embedding rows ({teacher_embedding.size(0)}) must match "
+                f"source_length ({self.source_length}). Filter the dataset and priors "
+                "with filter_dataset_by_gene_prior before creating NicheTrans."
+            )
+        found_mask = prior.get("found_mask")
+        if found_mask is not None:
+            found_mask = torch.as_tensor(found_mask, dtype=torch.bool)
+            if found_mask.ndim != 1 or found_mask.numel() != self.source_length:
+                raise ValueError(
+                    f"priors[{self.prior_model!r}]['found_mask'] must have length "
+                    f"{self.source_length}."
+                )
+            if not bool(found_mask.all()):
+                raise ValueError(
+                    f"priors[{self.prior_model!r}] still contains unmatched genes. "
+                    "Run filter_dataset_by_gene_prior before creating NicheTrans."
+                )
+        self.register_buffer("teacher_embedding", None, persistent=True)
+        self.teacher_embedding = teacher_embedding
 
 
     def forward(self, source, source_neighbor):
