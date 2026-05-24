@@ -5,6 +5,7 @@ import torchvision
 from torch import nn
 
 from model.attention import *
+from model.gene_prior_pooling import GenePriorPooling
 
 
 class NetBlock(nn.Module):
@@ -49,12 +50,18 @@ class NicheTrans(nn.Module):
         dropout_rate=0.1,
         priors=None,
         prior_model=None,
+        prior_pooling_mode="none",
+        prior_hidden_dim=128,
+        prior_expr_transform="identity",
     ):
         super(NicheTrans, self).__init__()
 
         self.source_length, self.target_length = source_length, target_length
         self.noise_rate, self.dropout_rate = noise_rate, dropout_rate
         self.prior_model = self._resolve_prior_model(priors, prior_model)
+        self.prior_pooling_mode = self._normalize_prior_pooling_mode(prior_pooling_mode)
+        self.prior_hidden_dim = prior_hidden_dim
+        self.prior_expr_transform = prior_expr_transform
 
         self.fea_size, self.img_size = 256, 128
 
@@ -102,6 +109,16 @@ class NicheTrans(nn.Module):
         self.register_buffer("teacher_embedding", None, persistent=False)
         self.teacher_embedding = None
         self._register_teacher_embedding(priors)
+
+        self.prior_pooling = None
+        self.prior_fusion = None
+        self._build_prior_pooling()
+
+    def _normalize_prior_pooling_mode(self, prior_pooling_mode):
+        mode = str(prior_pooling_mode).lower()
+        if mode not in {"none", "sigmoid", "softmax"}:
+            raise ValueError("prior_pooling_mode must be 'none', 'sigmoid', or 'softmax'.")
+        return mode
 
     def _resolve_prior_model(self, priors, prior_model):
         if priors is None:
@@ -159,17 +176,41 @@ class NicheTrans(nn.Module):
         self.register_buffer("teacher_embedding", None, persistent=True)
         self.teacher_embedding = teacher_embedding
 
+    def _build_prior_pooling(self):
+        if self.prior_pooling_mode == "none":
+            return
+        if self.teacher_embedding is None:
+            raise ValueError(
+                "prior_pooling_mode requires priors. Pass filtered priors or set "
+                "prior_pooling_mode='none'."
+            )
 
-    def forward(self, source, source_neighbor):
+        self.prior_pooling = GenePriorPooling(
+            gene_embedding_dim=self.teacher_embedding.size(1),
+            output_dim=self.fea_size,
+            hidden_dim=self.prior_hidden_dim,
+            mode=self.prior_pooling_mode,
+            expr_transform=self.prior_expr_transform,
+        )
+        self.prior_fusion = nn.Sequential(
+            nn.Linear(self.fea_size * 3, self.fea_size),
+            nn.LayerNorm(self.fea_size),
+            nn.LeakyReLU(),
+        )
+
+    def forward(self, source, source_neighbor, return_prior=False):
         b = source.size(0)
         l = source_neighbor.size(1)
         spatial_tokens = torch.cat([self.token_center, self.token_neigh_1.repeat(1, l//2, 1), self.token_neigh_2.repeat(1, l//2, 1)], dim=1)
 
-        source = source[:, None, :]
-        omic_data = torch.cat([source, source_neighbor], dim=1).view(-1, self.source_length)
+        source_expression = source
+        source_token = source[:, None, :]
+        omic_data = torch.cat([source_token, source_neighbor], dim=1).view(-1, self.source_length)
 
         # genome feature extraction, be aware that we add on the features
-        f_omic = self.encoder(omic_data).view(b, -1, self.fea_size) 
+        f_omic_raw = self.encoder(omic_data).view(b, -1, self.fea_size)
+        h_cell0 = f_omic_raw[:, 0, :]
+        f_omic = f_omic_raw
         f_omic = f_omic + spatial_tokens
 
         f_omic = self.non_linear(f_omic)
@@ -177,7 +218,25 @@ class NicheTrans(nn.Module):
         f_omic = self.fusion_omic(self.ln1(f_omic)) + f_omic
         f_omic = self.ffn_omic(self.ln2(f_omic)) + f_omic
 
-        f = self.dropout(f_omic[:, 0, :])
+        h_niche = f_omic[:, 0, :]
+        prior_info = {
+            "h_cell0": h_cell0,
+            "h_niche": h_niche,
+        }
+
+        if self.prior_pooling is not None:
+            z_prior, prior_weights = self.prior_pooling(
+                source_expression,
+                self.teacher_embedding,
+                h_niche,
+            )
+            f = self.prior_fusion(torch.cat([h_cell0, h_niche, z_prior], dim=1))
+            prior_info["z_prior"] = z_prior
+            prior_info["prior_weights"] = prior_weights
+        else:
+            f = h_niche
+
+        f = self.dropout(f)
 
         # final prediction
         out = []
@@ -185,5 +244,7 @@ class NicheTrans(nn.Module):
             out.append(self.predict_layers[i](f))
         out = torch.cat(out, dim=1)
 
+        if return_prior:
+            return out, prior_info
         return out
     

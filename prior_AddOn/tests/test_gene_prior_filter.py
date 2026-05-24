@@ -141,6 +141,92 @@ def test_nichetrans_rejects_unfiltered_prior():
         NicheTrans(source_length=3, target_length=1, priors=priors)
 
 
+def test_nichetrans_sigmoid_prior_pooling_forward_returns_weights():
+    pytest.importorskip("einops")
+    from model.nicheTrans import NicheTrans
+
+    model = NicheTrans(
+        source_length=3,
+        target_length=2,
+        priors=_toy_priors(),
+        prior_pooling_mode="sigmoid",
+    )
+    model.eval()
+    source = torch.rand(2, 3)
+    source_neighbor = torch.rand(2, 2, 3)
+
+    with torch.no_grad():
+        output, prior_info = model(source, source_neighbor, return_prior=True)
+
+    assert output.shape == (2, 2)
+    assert prior_info["prior_weights"].shape == (2, 3)
+    assert torch.all(prior_info["prior_weights"] >= 0)
+    assert torch.all(prior_info["prior_weights"] <= 1)
+    assert prior_info["h_cell0"].shape == (2, 256)
+    assert prior_info["h_niche"].shape == (2, 256)
+    assert prior_info["z_prior"].shape == (2, 256)
+
+
+def test_nichetrans_softmax_prior_pooling_weights_sum_to_one():
+    pytest.importorskip("einops")
+    from model.nicheTrans import NicheTrans
+
+    model = NicheTrans(
+        source_length=3,
+        target_length=2,
+        priors=_toy_priors(),
+        prior_pooling_mode="softmax",
+    )
+    model.eval()
+    source = torch.rand(2, 3)
+    source_neighbor = torch.rand(2, 2, 3)
+
+    with torch.no_grad():
+        output, prior_info = model(source, source_neighbor, return_prior=True)
+
+    assert output.shape == (2, 2)
+    assert prior_info["prior_weights"].shape == (2, 3)
+    assert torch.allclose(
+        prior_info["prior_weights"].sum(dim=1),
+        torch.ones(2),
+        atol=1e-6,
+    )
+
+
+def test_nichetrans_prior_pooling_requires_priors():
+    pytest.importorskip("einops")
+    from model.nicheTrans import NicheTrans
+
+    with pytest.raises(ValueError, match="requires priors"):
+        NicheTrans(source_length=3, target_length=1, prior_pooling_mode="sigmoid")
+
+
+def test_nichetrans_prior_pooling_none_keeps_default_forward_interface():
+    pytest.importorskip("einops")
+    from model.nicheTrans import NicheTrans
+
+    model = NicheTrans(source_length=3, target_length=2, prior_pooling_mode="none")
+    model.eval()
+    source = torch.rand(2, 3)
+    source_neighbor = torch.rand(2, 2, 3)
+
+    with torch.no_grad():
+        output = model(source, source_neighbor)
+
+    assert output.shape == (2, 2)
+    assert model.prior_pooling is None
+    assert model.prior_fusion is None
+
+
+def _toy_priors():
+    return {
+        "geneformer": {
+            "embeddings": torch.randn(3, 5),
+            "found_mask": torch.tensor([True, True, True]),
+        }
+    }
+
+
 def _ad_mouse_like_dataset():
     dataset = type("AD_Mouse", (), {})()
     dataset.source_panel = np.array(["A", "B", "C", "D"])
