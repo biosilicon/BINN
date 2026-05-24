@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,6 +34,10 @@ def load_static_gene_prior(
     dataset_key: str | None = None,
     write_aligned: bool = False,
     allow_network: bool = True,
+    use_aligned_cache: bool = True,
+    write_aligned_cache: bool = True,
+    precache_orthologs: bool = True,
+    retry_failed_mappings: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Load static priors aligned to the exact order of source_panel.
 
@@ -44,17 +50,40 @@ def load_static_gene_prior(
     species_key = _normalize_species(species)
     root_path = Path(root) if root is not None else DEFAULT_ROOT
     processed_dir = root_path / PROCESSED_DIRNAME
-    resolver = GeneResolver(root_path, allow_network=allow_network)
 
     requested_models = tuple(_normalize_model_name(m) for m in models)
-    loaded: dict[str, dict[str, Any]] = {}
+    results: dict[str, dict[str, Any]] = {}
+    pending_models: list[str] = []
+    cache_paths: dict[str, Path] = {}
     for model_name in requested_models:
+        cache_path = _aligned_cache_path(processed_dir, dataset_key, species_key, source_genes, model_name)
+        cache_paths[model_name] = cache_path
+        cached = _load_aligned_cache(cache_path, model_name, species_key, source_genes) if use_aligned_cache else None
+        if cached is None:
+            pending_models.append(model_name)
+        else:
+            results[model_name] = cached
+
+    if not pending_models:
+        return {model_name: results[model_name] for model_name in requested_models}
+
+    resolver = GeneResolver(
+        root_path,
+        allow_network=allow_network,
+        retry_failed_mappings=retry_failed_mappings,
+    )
+
+    loaded: dict[str, dict[str, Any]] = {}
+    for model_name in pending_models:
         loaded[model_name] = _load_static_model(model_name, processed_dir)
 
     geneformer_dicts = _load_geneformer_dictionaries(processed_dir, loaded)
 
-    results: dict[str, dict[str, Any]] = {}
-    for model_name in requested_models:
+    if species_key == "mouse" and precache_orthologs:
+        resolver.resolve_mouse_panel(source_genes, geneformer_dicts)
+        resolver.retry_failed_mappings = False
+
+    for model_name in pending_models:
         model_data = loaded[model_name]
         embedding_bank = model_data["embeddings"].detach().cpu()
         dim = int(embedding_bank.shape[1])
@@ -97,28 +126,106 @@ def load_static_gene_prior(
             "coverage": coverage,
         }
 
-        if write_aligned:
-            if not dataset_key:
-                raise ValueError("dataset_key is required when write_aligned=True")
-            aligned_dir = processed_dir / "aligned"
-            aligned_dir.mkdir(parents=True, exist_ok=True)
-            out_path = aligned_dir / f"{dataset_key}_{model_name}.pt"
-            torch.save(
-                {
-                    "model": model_name,
-                    "dataset_key": dataset_key,
-                    "species": species_key,
-                    "source_panel": source_genes,
-                    "embeddings": aligned,
-                    "found_mask": found_mask,
-                    "mapping_table": mapping_rows,
-                    "coverage": coverage,
-                },
-                out_path,
+        if write_aligned or write_aligned_cache:
+            _save_aligned_cache(
+                cache_paths[model_name],
+                model_name=model_name,
+                dataset_key=dataset_key,
+                species=species_key,
+                source_panel=source_genes,
+                payload=results[model_name],
             )
 
     resolver.flush()
-    return results
+    return {model_name: results[model_name] for model_name in requested_models}
+
+
+def _aligned_cache_path(
+    processed_dir: Path,
+    dataset_key: str | None,
+    species: str,
+    source_panel: list[str],
+    model_name: str,
+) -> Path:
+    aligned_dir = processed_dir / "aligned"
+    if dataset_key:
+        prefix = _safe_cache_component(dataset_key)
+    else:
+        prefix = f"auto_{species}_{_source_panel_hash(species, source_panel)}"
+    return aligned_dir / f"{prefix}_{model_name}.pt"
+
+
+def _load_aligned_cache(
+    path: Path,
+    model_name: str,
+    species: str,
+    source_panel: list[str],
+) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    torch = _require_torch()
+    try:
+        data = torch.load(path, map_location="cpu")
+    except Exception:
+        return None
+
+    if data.get("model") != model_name or data.get("species") != species:
+        return None
+    if [str(g) for g in data.get("source_panel", [])] != source_panel:
+        return None
+    required_keys = {"embeddings", "found_mask", "mapping_table", "coverage"}
+    if not required_keys.issubset(data):
+        return None
+    if int(data["embeddings"].shape[0]) != len(source_panel):
+        return None
+    if int(data["found_mask"].shape[0]) != len(source_panel):
+        return None
+    return {
+        "embeddings": data["embeddings"],
+        "found_mask": data["found_mask"],
+        "mapping_table": data["mapping_table"],
+        "coverage": data["coverage"],
+    }
+
+
+def _save_aligned_cache(
+    path: Path,
+    model_name: str,
+    dataset_key: str | None,
+    species: str,
+    source_panel: list[str],
+    payload: dict[str, Any],
+) -> None:
+    torch = _require_torch()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model": model_name,
+            "dataset_key": dataset_key,
+            "species": species,
+            "source_panel": source_panel,
+            "source_panel_hash": _source_panel_hash(species, source_panel),
+            "embeddings": payload["embeddings"],
+            "found_mask": payload["found_mask"],
+            "mapping_table": payload["mapping_table"],
+            "coverage": payload["coverage"],
+        },
+        path,
+    )
+
+
+def _source_panel_hash(species: str, source_panel: list[str]) -> str:
+    payload = json.dumps(
+        {"species": species, "source_panel": source_panel},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _safe_cache_component(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._")
+    return safe or "dataset"
 
 
 def _map_one_gene(
@@ -391,20 +498,46 @@ class GeneResolver:
         "updated_at",
     ]
 
-    def __init__(self, root: Path, allow_network: bool = True, timeout: int = 20):
+    def __init__(
+        self,
+        root: Path,
+        allow_network: bool = True,
+        timeout: int = 20,
+        retry_failed_mappings: bool = False,
+    ):
         self.root = root
         self.allow_network = allow_network
         self.timeout = timeout
+        self.retry_failed_mappings = retry_failed_mappings
         self.cache_path = root / PROCESSED_DIRNAME / "mapping_cache.tsv"
         self._cache: dict[tuple[str, str], dict[str, str]] = {}
         self._dirty = False
         self._load_cache()
 
+    def resolve_mouse_panel(self, genes: Iterable[Any], geneformer_dicts: dict[str, Any]) -> None:
+        seen: set[str] = set()
+        for gene in genes:
+            normalized = normalize_gene_name(gene)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+
+            if not normalized:
+                resolution = Resolution("invalid_input", reason="empty_gene_name")
+                self._update_cache("mouse", str(gene), normalized, resolution)
+                continue
+            if is_non_gene_feature(normalized):
+                resolution = Resolution("non_gene_feature", reason="looks_like_genomic_interval_or_special_token")
+                self._update_cache("mouse", str(gene), normalized, resolution)
+                continue
+
+            self.resolve_mouse_gene(str(gene), geneformer_dicts)
+
     def resolve_mouse_gene(self, gene: str, geneformer_dicts: dict[str, Any]) -> Resolution:
         normalized = normalize_gene_name(gene)
         cache_key = ("mouse", normalized)
         cached = self._cache.get(cache_key)
-        if cached and (cached.get("status") == "mapped" or not self.allow_network):
+        if cached and not self._should_retry_cached_mapping(cached):
             return Resolution(
                 status=cached.get("status", "unmapped"),
                 human_ensembl=cached.get("human_ensembl", ""),
@@ -451,13 +584,18 @@ class GeneResolver:
     def flush(self) -> None:
         if not self._dirty:
             return
+        self._write_cache()
+        self._dirty = False
+
+    def _write_cache(self) -> None:
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         rows = sorted(self._cache.values(), key=lambda r: (r["source_species"], r["normalized_gene"]))
-        with self.cache_path.open("w", newline="", encoding="utf-8") as handle:
+        tmp_path = self.cache_path.with_name(f"{self.cache_path.name}.tmp")
+        with tmp_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=self.cache_fields, delimiter="\t")
             writer.writeheader()
             writer.writerows(rows)
-        self._dirty = False
+        tmp_path.replace(self.cache_path)
 
     def _load_cache(self) -> None:
         if not self.cache_path.exists():
@@ -481,6 +619,14 @@ class GeneResolver:
             "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         self._dirty = True
+        self.flush()
+
+    def _should_retry_cached_mapping(self, cached: dict[str, str]) -> bool:
+        if not self.allow_network:
+            return False
+        if not self.retry_failed_mappings:
+            return False
+        return str(cached.get("reason", "")).startswith("ensembl_request_failed:")
 
     def _lookup_symbol(self, species: str, symbol: str) -> str | None:
         requests = _require_requests()
