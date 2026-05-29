@@ -86,9 +86,16 @@ def test_nichetrans_registers_teacher_embedding_from_selected_prior():
     pytest.importorskip("einops")
     from model.nicheTrans import NicheTrans
 
+    embeddings = torch.tensor(
+        [
+            [3.0, 4.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 5.0, 12.0, 0.0],
+            [1.0, 2.0, 2.0, 0.0, 0.0],
+        ]
+    )
     priors = {
         "geneformer": {
-            "embeddings": torch.randn(3, 5),
+            "embeddings": embeddings,
             "found_mask": torch.tensor([True, True, True]),
         }
     }
@@ -99,7 +106,83 @@ def test_nichetrans_registers_teacher_embedding_from_selected_prior():
     assert hasattr(model, "teacher_embedding")
     assert model.teacher_embedding.shape == (3, 5)
     assert not model.teacher_embedding.requires_grad
+    assert torch.allclose(model.teacher_embedding, embeddings)
     assert "teacher_embedding" in model.state_dict()
+
+
+def test_nichetrans_normalizes_teacher_embedding_to_unit_norm():
+    pytest.importorskip("einops")
+    from model.nicheTrans import NicheTrans
+
+    model = NicheTrans(
+        source_length=3,
+        target_length=1,
+        priors=_fixed_norm_priors(),
+        normalize_prior_embedding=True,
+    )
+
+    assert torch.allclose(
+        model.teacher_embedding.norm(p=2, dim=1),
+        torch.ones(3),
+    )
+
+
+def test_nichetrans_normalizes_teacher_embedding_to_custom_norm():
+    pytest.importorskip("einops")
+    from model.nicheTrans import NicheTrans
+
+    model = NicheTrans(
+        source_length=3,
+        target_length=1,
+        priors=_fixed_norm_priors(),
+        normalize_prior_embedding=True,
+        prior_embedding_norm=2.5,
+    )
+
+    assert torch.allclose(
+        model.teacher_embedding.norm(p=2, dim=1),
+        torch.full((3,), 2.5),
+    )
+
+
+def test_nichetrans_rejects_zero_norm_teacher_embedding_when_normalizing():
+    pytest.importorskip("einops")
+    from model.nicheTrans import NicheTrans
+
+    priors = {
+        "geneformer": {
+            "embeddings": torch.tensor(
+                [
+                    [1.0, 0.0],
+                    [0.0, 0.0],
+                    [0.0, 2.0],
+                ]
+            ),
+            "found_mask": torch.tensor([True, True, True]),
+        }
+    }
+
+    with pytest.raises(ValueError, match="zero-norm rows"):
+        NicheTrans(
+            source_length=3,
+            target_length=1,
+            priors=priors,
+            normalize_prior_embedding=True,
+        )
+
+
+def test_nichetrans_requires_positive_prior_embedding_norm():
+    pytest.importorskip("einops")
+    from model.nicheTrans import NicheTrans
+
+    with pytest.raises(ValueError, match="positive finite"):
+        NicheTrans(
+            source_length=3,
+            target_length=1,
+            priors=_fixed_norm_priors(),
+            normalize_prior_embedding=True,
+            prior_embedding_norm=0.0,
+        )
 
 
 def test_nichetrans_has_empty_teacher_embedding_without_priors():
@@ -226,6 +309,21 @@ def _toy_priors():
     return {
         "geneformer": {
             "embeddings": torch.randn(3, 5),
+            "found_mask": torch.tensor([True, True, True]),
+        }
+    }
+
+
+def _fixed_norm_priors():
+    return {
+        "geneformer": {
+            "embeddings": torch.tensor(
+                [
+                    [3.0, 4.0],
+                    [5.0, 12.0],
+                    [1.0, 2.0],
+                ]
+            ),
             "found_mask": torch.tensor([True, True, True]),
         }
     }

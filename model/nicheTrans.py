@@ -1,5 +1,7 @@
 from __future__ import absolute_import
 
+import math
+
 import torch
 import torchvision
 from torch import nn
@@ -53,6 +55,8 @@ class NicheTrans(nn.Module):
         prior_pooling_mode="none",
         prior_hidden_dim=128,
         prior_expr_transform="identity",
+        normalize_prior_embedding=False,
+        prior_embedding_norm=1.0,
     ):
         super(NicheTrans, self).__init__()
 
@@ -62,6 +66,8 @@ class NicheTrans(nn.Module):
         self.prior_pooling_mode = self._normalize_prior_pooling_mode(prior_pooling_mode)
         self.prior_hidden_dim = prior_hidden_dim
         self.prior_expr_transform = prior_expr_transform
+        self.normalize_prior_embedding = bool(normalize_prior_embedding)
+        self.prior_embedding_norm = self._validate_prior_embedding_norm(prior_embedding_norm)
 
         self.fea_size, self.img_size = 256, 128
 
@@ -120,6 +126,12 @@ class NicheTrans(nn.Module):
             raise ValueError("prior_pooling_mode must be 'none' or 'qkv'.")
         return mode
 
+    def _validate_prior_embedding_norm(self, prior_embedding_norm):
+        value = float(prior_embedding_norm)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("prior_embedding_norm must be a positive finite value.")
+        return value
+
     def _resolve_prior_model(self, priors, prior_model):
         if priors is None:
             return prior_model
@@ -173,8 +185,21 @@ class NicheTrans(nn.Module):
                     f"priors[{self.prior_model!r}] still contains unmatched genes. "
                     "Run filter_dataset_by_gene_prior before creating NicheTrans."
                 )
+        if self.normalize_prior_embedding:
+            teacher_embedding = self._normalize_teacher_embedding(teacher_embedding)
         self.register_buffer("teacher_embedding", None, persistent=True)
         self.teacher_embedding = teacher_embedding
+
+    def _normalize_teacher_embedding(self, teacher_embedding):
+        row_norms = teacher_embedding.norm(p=2, dim=1, keepdim=True)
+        zero_norm_mask = row_norms.squeeze(1) == 0
+        if bool(zero_norm_mask.any()):
+            zero_rows = zero_norm_mask.nonzero(as_tuple=False).flatten().tolist()
+            raise ValueError(
+                "Cannot normalize prior gene embeddings because zero-norm rows were "
+                f"found at indices {zero_rows}."
+            )
+        return teacher_embedding / row_norms * self.prior_embedding_norm
 
     def _build_prior_pooling(self):
         if self.prior_pooling_mode == "none":
