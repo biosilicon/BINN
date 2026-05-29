@@ -75,9 +75,9 @@ def test(model, testloader, ct_information=False, device=None):
     ##############
     auc_tau = roc_auc_score(target_list[:, 0], predict_list[:, 0])
     tn, fp, fn, tp = confusion_matrix(target_list[:, 0], (predict_list[:, 0] > 0.5).astype(int)).ravel()
-    sensitivity = tp / (tp + fn)
-    specificity = tn / (tn + fp)
-    print(f"tau AUC: {auc_tau}, tau sensitivity {sensitivity}, tay specificity {specificity}")
+    tau_sensitivity = tp / (tp + fn)
+    tau_specificity = tn / (tn + fp)
+    print(f"tau AUC: {auc_tau}, tau sensitivity {tau_sensitivity}, tay specificity {tau_specificity}")
 
     ##############
     auc_plaque = roc_auc_score(target_list[:, 1], predict_list[:, 1])
@@ -85,5 +85,14 @@ def test(model, testloader, ct_information=False, device=None):
     sensitivity = tp / (tp + fn)
     specificity = tn / (tn + fp)
     print(f"Aβ AUC: {auc_plaque}, Aβ sensitivity {sensitivity}, Aβ specificity {specificity}")
+    plaque_sensitivity = sensitivity
+    plaque_specificity = specificity
 
-    return None
+    return {
+        "tau_auc": auc_tau,
+        "tau_sensitivity": tau_sensitivity,
+        "tau_specificity": tau_specificity,
+        "plaque_auc": auc_plaque,
+        "plaque_sensitivity": plaque_sensitivity,
+        "plaque_specificity": plaque_specificity,
+    }
