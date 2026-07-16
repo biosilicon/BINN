@@ -166,7 +166,10 @@ Use `(0, 1)` for two visible GPUs or set `PARALLEL_COMPARE=False` for sequential
 training. With the default `device="auto"`, missing/invisible configured CUDA
 devices trigger a sequential CPU/GPU fallback; an explicit unavailable
 `device="cuda"` request still raises an error. Parallel workers do not wrap their
-models in `DataParallel`.
+models in `DataParallel`. They also force each inner PyTorch DataLoader to
+`workers=0`: spawning DataLoader worker processes from inside a `loky` process is
+unsupported and can fail with `AttributeError: 'Process' object has no attribute
+'env'`. The configured `--workers` value remains active for sequential runs.
 
 Each variant writes a distinct best checkpoint, history CSV, and per-feature
 validation CSV. The final `{run_name}_{mode}_comparison.csv` contains both summary
@@ -291,6 +294,7 @@ tests.
 - Creating dataloaders before gene-prior filtering leads to stale tensor dimensions.
 - Passing unfiltered priors to `NicheTrans` with `qkv` pooling raises a shape or missing-gene error by design.
 - Running both compare workers on one GPU can exhaust memory because each process owns a complete model, optimizer, batch, and CUDA allocator. Reduce batch sizes or use sequential execution when needed.
+- Parallel compare intentionally uses `dataloader_workers=0` inside each `loky` process to avoid nested multiprocessing; use the recorded column to confirm the effective value.
 - With the default `device="auto"`, `PARALLEL_COMPARE=True` falls back to sequential execution when CUDA or a configured GPU id is unavailable; inspect the warning and the recorded `process_id`, `device`, and `assigned_gpu_id` columns when confirming execution mode.
 - Changing the number/order of neighbors can break spatial token assumptions in some model variants. `nicheTrans.py` computes tokens from neighbor length; older variants hard-code repeat counts.
 - `requirements.txt` may not be portable across OS/CUDA combinations because of binary package pins.
