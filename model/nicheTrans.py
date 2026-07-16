@@ -3,7 +3,6 @@ from __future__ import absolute_import
 import math
 
 import torch
-import torchvision
 from torch import nn
 
 from model.attention import *
@@ -222,7 +221,16 @@ class NicheTrans(nn.Module):
     def forward(self, source, source_neighbor, return_prior=False):
         b = source.size(0)
         l = source_neighbor.size(1)
-        spatial_tokens = torch.cat([self.token_center, self.token_neigh_1.repeat(1, l//2, 1), self.token_neigh_2.repeat(1, l//2, 1)], dim=1)
+        near_neighbor_count = (l + 1) // 2
+        far_neighbor_count = l - near_neighbor_count
+        spatial_tokens = torch.cat(
+            [
+                self.token_center,
+                self.token_neigh_1.repeat(1, near_neighbor_count, 1),
+                self.token_neigh_2.repeat(1, far_neighbor_count, 1),
+            ],
+            dim=1,
+        )
 
         source_expression = source
         source_token = source[:, None, :]

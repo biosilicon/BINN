@@ -75,6 +75,7 @@ If the GPU check is `False`, stop before long training runs and fix the NVIDIA d
 | `Tutorial_7.*` | 10x Xenium breast cancer, static gene-prior capable | `datasets.data_manager_breast_cancer`, `model.nicheTrans`, `prior_AddOn` |
 | `Tutorial_8.*` | Human lymph node RNA to protein | `datasets.data_manager_human_lymph_node`, `model.nicheTrans_img` |
 | `Tutorial_9.*` | MISAR-seq ATAC to RNA / RNA to ATAC | `datasets.data_manager_MISAR_seq`, `model.nicheTrans_hd` |
+| `Tutorial_10.1` | Schema-compliant H5MU source-to-target training and validation | `datasets.h5mu_dataset`, `model.nicheTrans`, `utils.utils_training_h5mu` |
 
 `Tutorial_7.1__Train_NicheTrans_on_10x_Xenium_data copy.ipynb` is a duplicate/older copy. Prefer `Tutorial_7.1__Train_NicheTrans_on_10x_Xenium_data.ipynb` unless the user asks about the copy.
 
@@ -93,6 +94,45 @@ Important shape convention:
 - Target tensor: `[batch, target_length]`
 - `dataset.source_panel` order must match source tensor columns.
 - `dataset.target_panel` order must match target tensor columns.
+
+### Schema-compliant H5MU files
+
+Use `H5MuDataManager` when training and testing data are supplied as two
+independent spatial multi-omics `.h5mu` files. The manager validates both files,
+requires identical source/target feature names and order, and builds spatial
+neighbors independently within each file and `sample_id`.
+
+```python
+from datasets.h5mu_dataset import H5MuDataManager, validate_h5mu
+from utils.utils_h5mu_dataloader import h5mu_dataloader
+
+validate_h5mu("train.h5mu")
+dataset = H5MuDataManager(
+    train_path="train.h5mu",
+    test_path="test.h5mu",
+    source_modality="rna",
+    target_modality="protein",
+    n_neighbors=12,
+    preprocess="auto",
+)
+trainloader, testloader = h5mu_dataloader(args, dataset)
+```
+
+Each batch contains `(source, target, source_neighbors, obs_id)`. Automatic
+preprocessing normalizes count rows to a total of `1e3` before `log1p`, applies
+`log1p` to non-negative intensity data, and converts all model inputs to
+`float32`. Pass `preprocess="raw"` to disable these numeric transformations.
+Backed HDF5 handles are opened lazily per DataLoader worker, so the complete
+matrices are not densified in memory.
+
+`Tutorial_10.1__Train_NicheTrans_on_H5MU_data.ipynb` provides the corresponding
+standard NicheTrans workflow. It treats the testing H5MU as a periodic validation
+set, selects the best checkpoint by mean Pearson correlation (regression) or mean
+AUROC (binary), and writes training history plus per-feature metrics to CSV.
+
+This path requires `torch`, `mudata`, `anndata`, `h5py`, `numpy`, `pandas`, and
+`scipy`; it does not require Scanpy, scikit-learn, MuON, torchvision, or Pillow.
+Install `pytest` separately to run its automated tests.
 
 ## Model Variants
 
@@ -169,6 +209,13 @@ For model or data-manager changes, unit tests may not be enough because many pat
 
 ```powershell
 python -m compileall args datasets model utils prior_AddOn
+```
+
+Run the H5MU interface tests in the `iscdc` environment with:
+
+```powershell
+C:\Users\shetao\.conda\envs\iscdc\python.exe -m pip install pytest
+C:\Users\shetao\.conda\envs\iscdc\python.exe -m pytest datasets/tests/test_h5mu_dataset.py utils/tests/test_utils_training_h5mu.py
 ```
 
 For notebook changes, verify the edited notebook cells manually or run the smallest possible subset with local data paths.

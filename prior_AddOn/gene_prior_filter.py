@@ -51,7 +51,11 @@ def filter_dataset_by_gene_prior(
             f"No genes in dataset.source_panel were found in prior model {resolved_model!r}."
         )
 
-    source_index, neighbor_index = _resolve_feature_indices(dataset, source_index, neighbor_index)
+    lazy_selector = getattr(dataset, "select_source_features", None)
+    if not callable(lazy_selector):
+        source_index, neighbor_index = _resolve_feature_indices(
+            dataset, source_index, neighbor_index
+        )
     filtered_source_panel = [
         gene for gene, keep in zip(original_source_panel, keep_mask.tolist()) if keep
     ]
@@ -59,10 +63,15 @@ def filter_dataset_by_gene_prior(
         gene for gene, keep in zip(original_source_panel, keep_mask.tolist()) if not keep
     ]
 
-    dataset.source_panel = _filter_source_panel(dataset.source_panel, keep_mask, filtered_source_panel)
-    _update_length_attributes(dataset, len(filtered_source_panel))
-    _update_rna_mask(dataset, keep_mask, len(original_source_panel))
-    _filter_dataset_splits(dataset, keep_mask, source_index, neighbor_index)
+    if callable(lazy_selector):
+        lazy_selector(keep_mask)
+    else:
+        dataset.source_panel = _filter_source_panel(
+            dataset.source_panel, keep_mask, filtered_source_panel
+        )
+        _update_length_attributes(dataset, len(filtered_source_panel))
+        _update_rna_mask(dataset, keep_mask, len(original_source_panel))
+        _filter_dataset_splits(dataset, keep_mask, source_index, neighbor_index)
 
     filtered_priors = _filter_priors(priors, keep_mask)
     removed_mapping_table = [
