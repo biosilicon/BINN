@@ -75,7 +75,7 @@ If the GPU check is `False`, stop before long training runs and fix the NVIDIA d
 | `Tutorial_7.*` | 10x Xenium breast cancer, static gene-prior capable | `datasets.data_manager_breast_cancer`, `model.nicheTrans`, `prior_AddOn` |
 | `Tutorial_8.*` | Human lymph node RNA to protein | `datasets.data_manager_human_lymph_node`, `model.nicheTrans_img` |
 | `Tutorial_9.*` | MISAR-seq ATAC to RNA / RNA to ATAC | `datasets.data_manager_MISAR_seq`, `model.nicheTrans_hd` |
-| `Tutorial_10.1` | Schema-compliant H5MU source-to-target training and validation | `datasets.h5mu_dataset`, `model.nicheTrans`, `utils.utils_training_h5mu` |
+| `Tutorial_10.1` | Schema-compliant H5MU baseline/static-prior training and comparison | `datasets.h5mu_dataset`, `model.nicheTrans`, `prior_AddOn`, `utils.utils_training_h5mu` |
 
 `Tutorial_7.1__Train_NicheTrans_on_10x_Xenium_data copy.ipynb` is a duplicate/older copy. Prefer `Tutorial_7.1__Train_NicheTrans_on_10x_Xenium_data.ipynb` unless the user asks about the copy.
 
@@ -128,11 +128,56 @@ matrices are not densified in memory.
 `Tutorial_10.1__Train_NicheTrans_on_H5MU_data.ipynb` provides the corresponding
 standard NicheTrans workflow. It treats the testing H5MU as a periodic validation
 set, selects the best checkpoint by mean Pearson correlation (regression) or mean
-AUROC (binary), and writes training history plus per-feature metrics to CSV.
+AUROC (binary), and supports three direct notebook modes:
 
-This path requires `torch`, `mudata`, `anndata`, `h5py`, `numpy`, `pandas`, and
-`scipy`; it does not require Scanpy, scikit-learn, MuON, torchvision, or Pillow.
-Install `pytest` separately to run its automated tests.
+- `baseline`: train without static priors on the complete source panel. This mode
+  does not load or require prior artifacts.
+- `prior`: align and filter a selected scGPT/Geneformer prior, then train with QKV
+  prior pooling.
+- `compare`: train baseline and prior variants on the same prior-covered source
+  panel and seed, then report prior-minus-baseline metric deltas.
+
+Configure these switches in the notebook rather than through `args_h5mu.py`:
+
+```python
+EXPERIMENT_MODE = "compare"  # baseline | prior | compare
+PRIOR_MODEL = "scgpt"  # scgpt | geneformer
+PRIOR_ROOT = Path("prior_AddOn/gene_embeddings")
+PRIOR_ALLOW_NETWORK = False
+PRIOR_NORMALIZE_EMBEDDING = True
+
+PARALLEL_COMPARE = True
+PARALLEL_GPU_IDS = (0, 0)  # share GPU 0; use (0, 1) for two GPUs
+```
+
+Prior-enabled modes require RNA as the source modality. The notebook reads and
+canonicalizes human/mouse species from `uns['database']['organism']`, requires
+matching train/test organisms, aligns priors to `dataset.source_panel`, and filters
+the source panel before creating any DataLoader. In `compare` mode the baseline
+uses that same filtered panel so the comparison does not confound prior fusion
+with a different number of input genes.
+
+With `PARALLEL_COMPARE=True`, joblib's `loky` backend launches baseline and prior
+as two independent processes. Each process opens its own backed H5MU handles and
+builds its own model, optimizer, scheduler, and DataLoaders. Repeating a GPU id,
+for example `(0, 0)`, runs both processes concurrently on one GPU; this requires
+enough memory for both training jobs and may be slower if the GPU is saturated.
+Use `(0, 1)` for two visible GPUs or set `PARALLEL_COMPARE=False` for sequential
+training. With the default `device="auto"`, missing/invisible configured CUDA
+devices trigger a sequential CPU/GPU fallback; an explicit unavailable
+`device="cuda"` request still raises an error. Parallel workers do not wrap their
+models in `DataParallel`.
+
+Each variant writes a distinct best checkpoint, history CSV, and per-feature
+validation CSV. The final `{run_name}_{mode}_comparison.csv` contains both summary
+rows and, when both variants are present, `*_delta_vs_baseline` columns. Positive
+deltas are better for Pearson/Spearman/AUROC; negative deltas are better for loss
+and RMSE.
+
+This path requires `torch`, `mudata`, `anndata`, `h5py`, `numpy`, `pandas`,
+`scipy`, and `joblib`. Binary evaluation additionally requires `scikit-learn`.
+It does not require Scanpy, MuON, torchvision, or Pillow. Install `pytest`
+separately to run its automated tests.
 
 ## Model Variants
 
@@ -181,6 +226,10 @@ model = NicheTrans(
 )
 ```
 
+For H5MU experiments, Tutorial 10.1 performs this workflow automatically. It
+uses the H5MU organism metadata instead of a manually entered species and passes
+the resulting `keep_mask` to every independently constructed experiment dataset.
+
 Agent rules for prior work:
 
 - `filter_dataset_by_gene_prior` mutates and returns the dataset. Create dataloaders only after filtering.
@@ -211,14 +260,18 @@ For model or data-manager changes, unit tests may not be enough because many pat
 python -m compileall args datasets model utils prior_AddOn
 ```
 
-Run the H5MU interface tests in the `iscdc` environment with:
+Run all H5MU/prior regression tests in the `iscdc` environment with:
 
 ```powershell
-C:\Users\shetao\.conda\envs\iscdc\python.exe -m pip install pytest
-C:\Users\shetao\.conda\envs\iscdc\python.exe -m pytest datasets/tests/test_h5mu_dataset.py utils/tests/test_utils_training_h5mu.py
+$py = "C:\Users\shetao\.conda\envs\iscdc\python.exe"
+& $py -m pytest datasets/tests/test_h5mu_dataset.py utils/tests/test_utils_training_h5mu.py prior_AddOn/tests
 ```
 
-For notebook changes, verify the edited notebook cells manually or run the smallest possible subset with local data paths.
+For Tutorial 10.1 changes, validate the notebook JSON/code-cell syntax and run
+small sequential smoke experiments with `PARALLEL_COMPARE=False` for `baseline`,
+`prior`, and `compare`. GPU-process concurrency should be tested only in a CUDA
+environment with sufficient memory; do not infer GPU readiness from CPU smoke
+tests.
 
 ## Editing Guidance For Agents
 
@@ -237,5 +290,7 @@ For notebook changes, verify the edited notebook cells manually or run the small
 - Running a training notebook without overriding `args` paths will usually fail on missing original-author data directories.
 - Creating dataloaders before gene-prior filtering leads to stale tensor dimensions.
 - Passing unfiltered priors to `NicheTrans` with `qkv` pooling raises a shape or missing-gene error by design.
+- Running both compare workers on one GPU can exhaust memory because each process owns a complete model, optimizer, batch, and CUDA allocator. Reduce batch sizes or use sequential execution when needed.
+- With the default `device="auto"`, `PARALLEL_COMPARE=True` falls back to sequential execution when CUDA or a configured GPU id is unavailable; inspect the warning and the recorded `process_id`, `device`, and `assigned_gpu_id` columns when confirming execution mode.
 - Changing the number/order of neighbors can break spatial token assumptions in some model variants. `nicheTrans.py` computes tokens from neighbor length; older variants hard-code repeat counts.
 - `requirements.txt` may not be portable across OS/CUDA combinations because of binary package pins.
